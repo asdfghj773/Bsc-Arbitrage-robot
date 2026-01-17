@@ -1,0 +1,1170 @@
+"""
+BSC链AI套利机器人
+支持：PancakeSwap, Uniswap V2/V3, 闪电贷套利，AI预测套利
+"""
+
+import asyncio
+import json
+import time
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from decimal import Decimal
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from enum import Enum
+import aiohttp
+from web3 import Web3
+from web3.contract import Contract
+from web3.middleware import geth_poa_middleware
+import ccxt.async_support as ccxt
+
+# AI/ML 相关
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+import pickle
+import joblib
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('arbitrage_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class DexType(Enum):
+    """DEX类型枚举"""
+    PANCAKESWAP_V2 = "pancakeswap_v2"
+    PANCAKESWAP_V3 = "pancakeswap_v3"
+    BISWAP = "biswap"
+    APESWAP = "apeswap"
+    MDEX = "mdex"
+    UNISWAP_V2 = "uniswap_v2"
+    UNISWAP_V3 = "uniswap_v3"
+
+@dataclass
+class Token:
+    """代币信息"""
+    address: str
+    symbol: str
+    decimals: int
+    name: str
+
+@dataclass
+class Pool:
+    """流动性池信息"""
+    address: str
+    dex: DexType
+    token0: Token
+    token1: Token
+    reserve0: Decimal
+    reserve1: Decimal
+    fee: int  # 费率，如 3000 表示 0.3%
+    last_update: datetime
+
+@dataclass
+class ArbitrageOpportunity:
+    """套利机会"""
+    id: str
+    dex_in: DexType
+    dex_out: DexType
+    token_in: Token
+    token_out: Token
+    amount_in: Decimal
+    expected_amount_out: Decimal
+    actual_amount_out: Decimal
+    profit: Decimal
+    profit_percentage: Decimal
+    gas_cost: Decimal
+    net_profit: Decimal
+    risk_score: float
+    timestamp: datetime
+    path: List[str]
+    
+class BSCArbitrageBot:
+    """BSC链套利机器人主类"""
+    
+    def __init__(self, config_path: str = "config.json"):
+        """
+        初始化机器人
+        
+        Args:
+            config_path: 配置文件路径
+        """
+        self.config = self._load_config(config_path)
+        self.w3 = self._init_web3()
+        self._init_contracts()
+        
+        # 数据存储
+        self.token_cache: Dict[str, Token] = {}
+        self.pool_cache: Dict[str, Pool] = {}
+        self.opportunities: List[ArbitrageOpportunity] = []
+        self.transaction_history: List[Dict] = []
+        
+        # AI模型
+        self.price_predictor = None
+        self.opportunity_classifier = None
+        self.scaler = StandardScaler()
+        
+        # 交易所API
+        self.binance = ccxt.binance({
+            'apiKey': self.config.get('binance_api_key', ''),
+            'secret': self.config.get('binance_api_secret', ''),
+            'enableRateLimit': True,
+        })
+        
+        # 性能指标
+        self.total_profit = Decimal('0')
+        self.total_trades = 0
+        self.successful_trades = 0
+        
+        # 异步会话
+        self.session = None
+        
+        logger.info("BSC套利机器人初始化完成")
+    
+    def _load_config(self, config_path: str) -> Dict:
+        """加载配置文件"""
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # 设置默认值
+            defaults = {
+                'min_profit_percentage': 0.005,  # 0.5%
+                'max_slippage': 0.01,  # 1%
+                'max_gas_price': 20,  # Gwei
+                'check_interval': 1,  # 秒
+                'max_position_size': 0.1,  # 10%
+                'daily_loss_limit': 0.05,  # 5%
+            }
+            
+            for key, value in defaults.items():
+                if key not in config:
+                    config[key] = value
+            
+            return config
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
+            raise
+    
+    def _init_web3(self) -> Web3:
+        """初始化Web3连接"""
+        rpc_url = self.config.get('rpc_url', 'https://bsc-dataseed1.binance.org/')
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        
+        # 添加POA中间件（BSC需要）
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        
+        if not w3.is_connected():
+            raise ConnectionError("无法连接到BSC节点")
+        
+        logger.info(f"成功连接到BSC网络，当前区块: {w3.eth.block_number}")
+        return w3
+    
+    def _init_contracts(self):
+        """初始化智能合约"""
+        # PancakeSwap Router V2
+        self.pancake_router_v2 = self.w3.eth.contract(
+            address=Web3.to_checksum_address('0x10ED43C718714eb63d5aA57B78B54704E256024E'),
+            abi=self._load_abi('pancake_router_v2')
+        )
+        
+        # PancakeSwap Factory V2
+        self.pancake_factory_v2 = self.w3.eth.contract(
+            address=Web3.to_checksum_address('0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73'),
+            abi=self._load_abi('pancake_factory_v2')
+        )
+        
+        # 其他DEX合约...
+        
+        # ERC20 ABI
+        self.erc20_abi = self._load_abi('erc20')
+    
+    def _load_abi(self, contract_name: str) -> List:
+        """加载合约ABI"""
+        abi_path = f'abi/{contract_name}.json'
+        try:
+            with open(abi_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            # 如果文件不存在，使用简化的ABI
+            if contract_name == 'erc20':
+                return [
+                    {
+                        "constant": True,
+                        "inputs": [{"name": "_owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function"
+                    },
+                    {
+                        "constant": False,
+                        "inputs": [
+                            {"name": "_to", "type": "address"},
+                            {"name": "_value", "type": "uint256"}
+                        ],
+                        "name": "transfer",
+                        "outputs": [{"name": "", "type": "bool"}],
+                        "type": "function"
+                    },
+                    {
+                        "constant": True,
+                        "inputs": [],
+                        "name": "decimals",
+                        "outputs": [{"name": "", "type": "uint8"}],
+                        "type": "function"
+                    },
+                    {
+                        "constant": True,
+                        "inputs": [],
+                        "name": "symbol",
+                        "outputs": [{"name": "", "type": "string"}],
+                        "type": "function"
+                    }
+                ]
+            return []
+    
+    async def get_token_info(self, address: str) -> Token:
+        """获取代币信息"""
+        if address in self.token_cache:
+            return self.token_cache[address]
+        
+        checksum_address = Web3.to_checksum_address(address)
+        token_contract = self.w3.eth.contract(address=checksum_address, abi=self.erc20_abi)
+        
+        try:
+            symbol = token_contract.functions.symbol().call()
+            decimals = token_contract.functions.decimals().call()
+            name = symbol  # 可以调用name()获取完整名称
+            
+            token = Token(
+                address=checksum_address,
+                symbol=symbol,
+                decimals=decimals,
+                name=name
+            )
+            
+            self.token_cache[address] = token
+            return token
+        except Exception as e:
+            logger.error(f"获取代币信息失败 {address}: {e}")
+            raise
+    
+    async def get_pool_info(self, token0_addr: str, token1_addr: str, dex: DexType = DexType.PANCAKESWAP_V2) -> Optional[Pool]:
+        """获取流动性池信息"""
+        pool_id = f"{token0_addr}_{token1_addr}_{dex.value}"
+        
+        if pool_id in self.pool_cache:
+            pool = self.pool_cache[pool_id]
+            # 如果数据太旧，强制刷新
+            if (datetime.now() - pool.last_update).seconds > 30:
+                del self.pool_cache[pool_id]
+            else:
+                return pool
+        
+        try:
+            token0 = await self.get_token_info(token0_addr)
+            token1 = await self.get_token_info(token1_addr)
+            
+            # 获取Pair地址
+            if dex == DexType.PANCAKESWAP_V2:
+                pair_address = self.pancake_factory_v2.functions.getPair(
+                    Web3.to_checksum_address(token0_addr),
+                    Web3.to_checksum_address(token1_addr)
+                ).call()
+                
+                if pair_address == '0x' + '0' * 40:
+                    return None
+                
+                # 获取储备量
+                pair_contract = self.w3.eth.contract(
+                    address=pair_address,
+                    abi=self._load_abi('pair')
+                )
+                
+                reserves = pair_contract.functions.getReserves().call()
+                reserve0 = Decimal(str(reserves[0])) / (10 ** token0.decimals)
+                reserve1 = Decimal(str(reserves[1])) / (10 ** token1.decimals)
+                
+                pool = Pool(
+                    address=pair_address,
+                    dex=dex,
+                    token0=token0,
+                    token1=token1,
+                    reserve0=reserve0,
+                    reserve1=reserve1,
+                    fee=25,  # PancakeSwap V2 默认0.25%
+                    last_update=datetime.now()
+                )
+                
+                self.pool_cache[pool_id] = pool
+                return pool
+                
+        except Exception as e:
+            logger.error(f"获取池子信息失败 {pool_id}: {e}")
+        
+        return None
+    
+    def calculate_price(self, pool: Pool, token_in: Token, token_out: Token) -> Decimal:
+        """计算价格"""
+        if token_in.address == pool.token0.address and token_out.address == pool.token1.address:
+            # token0 -> token1
+            if pool.reserve0 == 0:
+                return Decimal('0')
+            return pool.reserve1 / pool.reserve0
+        elif token_in.address == pool.token1.address and token_out.address == pool.token0.address:
+            # token1 -> token0
+            if pool.reserve1 == 0:
+                return Decimal('0')
+            return pool.reserve0 / pool.reserve1
+        else:
+            return Decimal('0')
+    
+    async def find_arbitrage_opportunities(self) -> List[ArbitrageOpportunity]:
+        """寻找套利机会"""
+        opportunities = []
+        
+        # 1. DEX间套利 (PancakeSwap V2 vs Biswap vs ApeSwap)
+        dex_arb_opps = await self.find_dex_arbitrage()
+        opportunities.extend(dex_arb_opps)
+        
+        # 2. 三角套利
+        triangular_arb_opps = await self.find_triangular_arbitrage()
+        opportunities.extend(triangular_arb_opps)
+        
+        # 3. AI预测套利
+        ai_arb_opps = await self.find_ai_arbitrage()
+        opportunities.extend(ai_arb_opps)
+        
+        # 过滤和排序
+        filtered_opps = self.filter_opportunities(opportunities)
+        sorted_opps = sorted(filtered_opps, key=lambda x: x.net_profit, reverse=True)
+        
+        return sorted_opps[:10]  # 返回前10个最佳机会
+    
+    async def find_dex_arbitrage(self) -> List[ArbitrageOpportunity]:
+        """寻找DEX间套利机会"""
+        opportunities = []
+        
+        # 热门交易对
+        common_pairs = [
+            ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', '0x55d398326f99059fF775485246999027B3197955'),  # WBNB-USDT
+            ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56'),  # WBNB-BUSD
+            ('0x55d398326f99059fF775485246999027B3197955', '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56'),  # USDT-BUSD
+        ]
+        
+        for token0_addr, token1_addr in common_pairs:
+            # 从不同DEX获取价格
+            prices = {}
+            
+            for dex in [DexType.PANCAKESWAP_V2, DexType.BISWAP, DexType.APESWAP]:
+                pool = await self.get_pool_info(token0_addr, token1_addr, dex)
+                if pool:
+                    token0 = await self.get_token_info(token0_addr)
+                    token1 = await self.get_token_info(token1_addr)
+                    price = self.calculate_price(pool, token0, token1)
+                    prices[dex] = price
+            
+            # 寻找价格差异
+            if len(prices) >= 2:
+                max_price_dex = max(prices.items(), key=lambda x: x[1])
+                min_price_dex = min(prices.items(), key=lambda x: x[1])
+                
+                price_diff = max_price_dex[1] - min_price_dex[1]
+                price_diff_percentage = price_diff / min_price_dex[1] if min_price_dex[1] > 0 else 0
+                
+                if price_diff_percentage > self.config['min_profit_percentage']:
+                    # 计算利润
+                    amount_in = Decimal('1')  # 假设1个代币
+                    expected_profit = amount_in * price_diff_percentage
+                    
+                    # 估算Gas费用
+                    gas_cost = await self.estimate_gas_cost()
+                    
+                    opportunity = ArbitrageOpportunity(
+                        id=f"dex_arb_{datetime.now().timestamp()}",
+                        dex_in=min_price_dex[0],
+                        dex_out=max_price_dex[0],
+                        token_in=await self.get_token_info(token0_addr),
+                        token_out=await self.get_token_info(token1_addr),
+                        amount_in=amount_in,
+                        expected_amount_out=amount_in * max_price_dex[1],
+                        actual_amount_out=Decimal('0'),
+                        profit=expected_profit,
+                        profit_percentage=price_diff_percentage,
+                        gas_cost=gas_cost,
+                        net_profit=expected_profit - gas_cost,
+                        risk_score=0.2,  # 低风险
+                        timestamp=datetime.now(),
+                        path=[token0_addr, token1_addr]
+                    )
+                    
+                    opportunities.append(opportunity)
+        
+        return opportunities
+    
+    async def find_triangular_arbitrage(self) -> List[ArbitrageOpportunity]:
+        """寻找三角套利机会"""
+        opportunities = []
+        
+        # 常见三角套利路径
+        triangles = [
+            # WBNB -> USDT -> BUSD -> WBNB
+            [
+                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',  # WBNB
+                '0x55d398326f99059fF775485246999027B3197955',  # USDT
+                '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',  # BUSD
+                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c'   # WBNB
+            ],
+            # WBNB -> BUSD -> USDT -> WBNB
+            [
+                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',  # WBNB
+                '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',  # BUSD
+                '0x55d398326f99059fF775485246999027B3197955',  # USDT
+                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c'   # WBNB
+            ]
+        ]
+        
+        for path in triangles:
+            try:
+                # 获取每个池子的价格
+                prices = []
+                for i in range(len(path) - 1):
+                    token0_addr = path[i]
+                    token1_addr = path[i + 1]
+                    
+                    pool = await self.get_pool_info(token0_addr, token1_addr, DexType.PANCAKESWAP_V2)
+                    if not pool:
+                        break
+                    
+                    token0 = await self.get_token_info(token0_addr)
+                    token1 = await self.get_token_info(token1_addr)
+                    price = self.calculate_price(pool, token0, token1)
+                    prices.append(price)
+                
+                if len(prices) == 3:
+                    # 计算最终金额
+                    amount_in = Decimal('1')
+                    amount_out = amount_in
+                    
+                    for i, price in enumerate(prices):
+                        if i % 2 == 0:
+                            amount_out *= price  # 乘以价格
+                        else:
+                            amount_out /= price  # 除以价格
+                    
+                    # 考虑交易费用
+                    fee_multiplier = Decimal('0.9975') ** 3  # 0.25% 费用 * 3次交易
+                    amount_out *= fee_multiplier
+                    
+                    profit = amount_out - amount_in
+                    profit_percentage = profit / amount_in if amount_in > 0 else 0
+                    
+                    if profit_percentage > self.config['min_profit_percentage']:
+                        # 估算Gas费用
+                        gas_cost = await self.estimate_gas_cost() * 3  # 3次交易
+                        
+                        opportunity = ArbitrageOpportunity(
+                            id=f"tri_arb_{datetime.now().timestamp()}",
+                            dex_in=DexType.PANCAKESWAP_V2,
+                            dex_out=DexType.PANCAKESWAP_V2,
+                            token_in=await self.get_token_info(path[0]),
+                            token_out=await self.get_token_info(path[0]),
+                            amount_in=amount_in,
+                            expected_amount_out=amount_out,
+                            actual_amount_out=Decimal('0'),
+                            profit=profit,
+                            profit_percentage=profit_percentage,
+                            gas_cost=gas_cost,
+                            net_profit=profit - gas_cost,
+                            risk_score=0.3,  # 中等风险
+                            timestamp=datetime.now(),
+                            path=path
+                        )
+                        
+                        opportunities.append(opportunity)
+                        
+            except Exception as e:
+                logger.error(f"计算三角套利失败: {e}")
+                continue
+        
+        return opportunities
+    
+    async def find_ai_arbitrage(self) -> List[ArbitrageOpportunity]:
+        """使用AI寻找套利机会"""
+        opportunities = []
+        
+        if not self.price_predictor:
+            # 如果没有训练好的模型，使用简单策略
+            return await self.find_momentum_arbitrage()
+        
+        try:
+            # 获取市场数据
+            market_data = await self.collect_market_data()
+            
+            # 使用AI预测价格变动
+            predictions = self.predict_price_movements(market_data)
+            
+            # 基于预测寻找机会
+            for token_addr, prediction in predictions.items():
+                if abs(prediction) > 0.01:  # 预测变动大于1%
+                    # 寻找相关交易对
+                    related_pools = await self.find_related_pools(token_addr)
+                    
+                    for pool in related_pools:
+                        # 计算预期利润
+                        expected_profit_percentage = abs(prediction) * 0.8  # 假设能获取80%的预测变动
+                        
+                        if expected_profit_percentage > self.config['min_profit_percentage']:
+                            opportunity = ArbitrageOpportunity(
+                                id=f"ai_arb_{datetime.now().timestamp()}",
+                                dex_in=DexType.PANCAKESWAP_V2,
+                                dex_out=DexType.PANCAKESWAP_V2,
+                                token_in=await self.get_token_info(token_addr),
+                                token_out=await self.get_token_info(token_addr),
+                                amount_in=Decimal('1'),
+                                expected_amount_out=Decimal('1') * (1 + expected_profit_percentage),
+                                actual_amount_out=Decimal('0'),
+                                profit=Decimal(str(expected_profit_percentage)),
+                                profit_percentage=Decimal(str(expected_profit_percentage)),
+                                gas_cost=await self.estimate_gas_cost(),
+                                net_profit=Decimal(str(expected_profit_percentage)) - await self.estimate_gas_cost(),
+                                risk_score=0.4,  # 较高风险
+                                timestamp=datetime.now(),
+                                path=[token_addr, token_addr]
+                            )
+                            
+                            opportunities.append(opportunity)
+        
+        except Exception as e:
+            logger.error(f"AI套利寻找失败: {e}")
+        
+        return opportunities
+    
+    async def find_momentum_arbitrage(self) -> List[ArbitrageOpportunity]:
+        """动量套利策略"""
+        opportunities = []
+        
+        # 获取热门代币
+        hot_tokens = await self.get_hot_tokens()
+        
+        for token_addr in hot_tokens[:10]:  # 前10个热门代币
+            try:
+                # 获取价格历史
+                price_history = await self.get_price_history(token_addr, hours=1)
+                
+                if len(price_history) >= 10:
+                    # 计算动量
+                    recent_prices = price_history[-5:]
+                    older_prices = price_history[-10:-5]
+                    
+                    recent_avg = sum(recent_prices) / len(recent_prices)
+                    older_avg = sum(older_prices) / len(older_prices)
+                    
+                    momentum = (recent_avg - older_avg) / older_avg if older_avg > 0 else 0
+                    
+                    if abs(momentum) > 0.02:  # 动量大于2%
+                        # 寻找交易机会
+                        related_pools = await self.find_related_pools(token_addr)
+                        
+                        for pool in related_pools:
+                            opportunity = ArbitrageOpportunity(
+                                id=f"momentum_arb_{datetime.now().timestamp()}",
+                                dex_in=DexType.PANCAKESWAP_V2,
+                                dex_out=DexType.PANCAKESWAP_V2,
+                                token_in=await self.get_token_info(token_addr),
+                                token_out=await self.get_token_info(pool.token1.address),
+                                amount_in=Decimal('1'),
+                                expected_amount_out=Decimal('1') * (1 + momentum * 0.7),
+                                actual_amount_out=Decimal('0'),
+                                profit=Decimal(str(momentum * 0.7)),
+                                profit_percentage=Decimal(str(momentum * 0.7)),
+                                gas_cost=await self.estimate_gas_cost(),
+                                net_profit=Decimal(str(momentum * 0.7)) - await self.estimate_gas_cost(),
+                                risk_score=0.5,  # 高风险
+                                timestamp=datetime.now(),
+                                path=[token_addr, pool.token1.address]
+                            )
+                            
+                            opportunities.append(opportunity)
+                            
+            except Exception as e:
+                logger.error(f"动量套利计算失败 {token_addr}: {e}")
+                continue
+        
+        return opportunities
+    
+    async def get_hot_tokens(self) -> List[str]:
+        """获取热门代币列表"""
+        try:
+            if self.session is None:
+                self.session = aiohttp.ClientSession()
+            
+            # 从DeFiLlama获取热门代币
+            url = "https://api.llama.fi/trending"
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    tokens = [token['address'] for token in data.get('tokens', [])[:20]]
+                    return tokens
+            
+            # 如果API失败，返回默认列表
+            return [
+                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',  # WBNB
+                '0x55d398326f99059fF775485246999027B3197955',  # USDT
+                '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',  # BUSD
+                '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82',  # CAKE
+                '0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c',  # BTCB
+                '0x2170Ed0880ac9A755fd29B2688956BD959F933F8',  # ETH
+            ]
+            
+        except Exception as e:
+            logger.error(f"获取热门代币失败: {e}")
+            return []
+    
+    async def estimate_gas_cost(self) -> Decimal:
+        """估算Gas费用"""
+        try:
+            gas_price = self.w3.eth.gas_price
+            gas_limit = 200000  # 典型swap交易Gas限制
+            
+            gas_cost_wei = gas_price * gas_limit
+            gas_cost_bnb = Decimal(str(gas_cost_wei)) / Decimal('1e18')
+            
+            # 转换为USDT（假设BNB价格）
+            bnb_price = await self.get_bnb_price()
+            gas_cost_usd = gas_cost_bnb * Decimal(str(bnb_price))
+            
+            return gas_cost_usd
+        except:
+            return Decimal('1')  # 默认1美元
+    
+    async def get_bnb_price(self) -> float:
+        """获取BNB价格"""
+        try:
+            ticker = await self.binance.fetch_ticker('BNB/USDT')
+            return float(ticker['last'])
+        except:
+            return 300  # 默认300美元
+    
+    def filter_opportunities(self, opportunities: List[ArbitrageOpportunity]) -> List[ArbitrageOpportunity]:
+        """过滤套利机会"""
+        filtered = []
+        
+        for opp in opportunities:
+            # 检查最小利润
+            if opp.net_profit <= Decimal('0'):
+                continue
+            
+            # 检查滑点
+            if opp.profit_percentage < self.config['min_profit_percentage']:
+                continue
+            
+            # 检查风险分数
+            if opp.risk_score > 0.8:  # 高风险
+                continue
+            
+            # 检查Gas价格
+            current_gas = self.w3.eth.gas_price / 1e9  # Gwei
+            if current_gas > self.config['max_gas_price']:
+                continue
+            
+            filtered.append(opp)
+        
+        return filtered
+    
+    async def execute_arbitrage(self, opportunity: ArbitrageOpportunity) -> bool:
+        """执行套利交易"""
+        try:
+            logger.info(f"执行套利: {opportunity.id}")
+            logger.info(f"路径: {opportunity.path}")
+            logger.info(f"预期利润: {opportunity.net_profit:.4f} USD")
+            
+            # 检查账户余额
+            account = self.w3.eth.account.from_key(self.config['private_key'])
+            balance = self.w3.eth.get_balance(account.address)
+            balance_bnb = Decimal(str(balance)) / Decimal('1e18')
+            
+            if balance_bnb < Decimal('0.01'):  # 至少需要0.01 BNB
+                logger.error("BNB余额不足")
+                return False
+            
+            # 构建交易
+            if opportunity.dex_in == DexType.PANCAKESWAP_V2:
+                success = await self.execute_pancakeswap_v2_swap(opportunity)
+            else:
+                logger.error(f"不支持的DEX类型: {opportunity.dex_in}")
+                return False
+            
+            if success:
+                self.successful_trades += 1
+                self.total_profit += opportunity.net_profit
+                logger.info(f"套利成功! 净利润: {opportunity.net_profit:.4f} USD")
+                
+                # 记录交易
+                self.transaction_history.append({
+                    'id': opportunity.id,
+                    'timestamp': datetime.now().isoformat(),
+                    'profit': float(opportunity.net_profit),
+                    'type': 'arbitrage',
+                    'status': 'success'
+                })
+            else:
+                logger.error("套利执行失败")
+                
+            self.total_trades += 1
+            return success
+            
+        except Exception as e:
+            logger.error(f"执行套利失败: {e}")
+            return False
+    
+    async def execute_pancakeswap_v2_swap(self, opportunity: ArbitrageOpportunity) -> bool:
+        """在PancakeSwap V2执行交换"""
+        try:
+            # 获取账户
+            account = self.w3.eth.account.from_key(self.config['private_key'])
+            
+            # 准备交易参数
+            path = [Web3.to_checksum_address(addr) for addr in opportunity.path]
+            
+            # 计算最小输出数量（考虑滑点）
+            min_amount_out = int(opportunity.expected_amount_out * 
+                               (1 - self.config['max_slippage']) * 
+                               (10 ** opportunity.token_out.decimals))
+            
+            # 获取当前时间戳（10分钟过期）
+            deadline = int(time.time()) + 600
+            
+            # 构建交易
+            if opportunity.token_in.address == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c':  # WBNB
+                # BNB -> 代币
+                tx = self.pancake_router_v2.functions.swapExactETHForTokens(
+                    min_amount_out,
+                    path,
+                    account.address,
+                    deadline
+                ).build_transaction({
+                    'from': account.address,
+                    'value': int(opportunity.amount_in * Decimal('1e18')),
+                    'gas': 250000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(account.address),
+                })
+            elif opportunity.token_out.address == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c':  # WBNB
+                # 代币 -> BNB
+                # 需要先授权代币
+                token_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(opportunity.token_in.address),
+                    abi=self.erc20_abi
+                )
+                
+                # 授权
+                approve_tx = token_contract.functions.approve(
+                    self.pancake_router_v2.address,
+                    int(opportunity.amount_in * (10 ** opportunity.token_in.decimals))
+                ).build_transaction({
+                    'from': account.address,
+                    'gas': 50000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(account.address),
+                })
+                
+                signed_approve = account.sign_transaction(approve_tx)
+                approve_hash = self.w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+                self.w3.eth.wait_for_transaction_receipt(approve_hash)
+                
+                # 执行交换
+                tx = self.pancake_router_v2.functions.swapExactTokensForETH(
+                    int(opportunity.amount_in * (10 ** opportunity.token_in.decimals)),
+                    min_amount_out,
+                    path,
+                    account.address,
+                    deadline
+                ).build_transaction({
+                    'from': account.address,
+                    'gas': 250000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(account.address) + 1,
+                })
+            else:
+                # 代币 -> 代币
+                token_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(opportunity.token_in.address),
+                    abi=self.erc20_abi
+                )
+                
+                # 授权
+                approve_tx = token_contract.functions.approve(
+                    self.pancake_router_v2.address,
+                    int(opportunity.amount_in * (10 ** opportunity.token_in.decimals))
+                ).build_transaction({
+                    'from': account.address,
+                    'gas': 50000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(account.address),
+                })
+                
+                signed_approve = account.sign_transaction(approve_tx)
+                approve_hash = self.w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+                self.w3.eth.wait_for_transaction_receipt(approve_hash)
+                
+                # 执行交换
+                tx = self.pancake_router_v2.functions.swapExactTokensForTokens(
+                    int(opportunity.amount_in * (10 ** opportunity.token_in.decimals)),
+                    min_amount_out,
+                    path,
+                    account.address,
+                    deadline
+                ).build_transaction({
+                    'from': account.address,
+                    'gas': 250000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(account.address) + 1,
+                })
+            
+            # 签名并发送交易
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            
+            # 等待交易确认
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            if receipt.status == 1:
+                logger.info(f"交易成功: {tx_hash.hex()}")
+                return True
+            else:
+                logger.error(f"交易失败: {tx_hash.hex()}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"PancakeSwap交换失败: {e}")
+            return False
+    
+    async def run(self):
+        """运行机器人主循环"""
+        logger.info("启动套利机器人...")
+        
+        try:
+            while True:
+                start_time = time.time()
+                
+                try:
+                    # 寻找套利机会
+                    opportunities = await self.find_arbitrage_opportunities()
+                    
+                    if opportunities:
+                        logger.info(f"找到 {len(opportunities)} 个套利机会")
+                        
+                        # 执行最佳机会
+                        best_opportunity = opportunities[0]
+                        if best_opportunity.net_profit > Decimal('5'):  # 至少5美元利润
+                            await self.execute_arbitrage(best_opportunity)
+                        else:
+                            logger.info(f"最佳机会利润太低: {best_opportunity.net_profit:.2f} USD")
+                    else:
+                        logger.info("未找到套利机会")
+                    
+                    # 打印状态
+                    self.print_status()
+                    
+                except Exception as e:
+                    logger.error(f"主循环错误: {e}")
+                
+                # 控制循环速度
+                elapsed = time.time() - start_time
+                sleep_time = max(0, self.config['check_interval'] - elapsed)
+                await asyncio.sleep(sleep_time)
+                
+        except KeyboardInterrupt:
+            logger.info("收到停止信号，正在关闭...")
+        finally:
+            await self.shutdown()
+    
+    def print_status(self):
+        """打印机器人状态"""
+        success_rate = (self.successful_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        
+        print("\n" + "="*50)
+        print(f"BSC套利机器人状态")
+        print(f"总交易次数: {self.total_trades}")
+        print(f"成功交易: {self.successful_trades}")
+        print(f"成功率: {success_rate:.1f}%")
+        print(f"总利润: {self.total_profit:.2f} USD")
+        print(f"当前区块: {self.w3.eth.block_number}")
+        print(f"当前Gas价格: {self.w3.eth.gas_price / 1e9:.1f} Gwei")
+        print("="*50 + "\n")
+    
+    async def shutdown(self):
+        """关闭机器人"""
+        logger.info("正在关闭机器人...")
+        
+        if self.session:
+            await self.session.close()
+        
+        if hasattr(self, 'binance'):
+            await self.binance.close()
+        
+        # 保存模型和状态
+        self.save_state()
+        
+        logger.info("机器人已关闭")
+
+    def save_state(self):
+        """保存状态"""
+        try:
+            state = {
+                'total_profit': float(self.total_profit),
+                'total_trades': self.total_trades,
+                'successful_trades': self.successful_trades,
+                'transaction_history': self.transaction_history,
+                'last_run': datetime.now().isoformat()
+            }
+            
+            with open('bot_state.json', 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            logger.info("状态已保存")
+        except Exception as e:
+            logger.error(f"保存状态失败: {e}")
+
+    async def collect_market_data(self) -> pd.DataFrame:
+        """收集市场数据用于AI训练"""
+        # 这里实现市场数据收集逻辑
+        # 包括价格、交易量、流动性等
+        return pd.DataFrame()
+    
+    def predict_price_movements(self, market_data: pd.DataFrame) -> Dict[str, float]:
+        """预测价格变动"""
+        # 这里实现AI预测逻辑
+        return {}
+    
+    async def find_related_pools(self, token_addr: str) -> List[Pool]:
+        """查找与代币相关的流动性池"""
+        # 这里实现查找相关池的逻辑
+        return []
+    
+    async def get_price_history(self, token_addr: str, hours: int) -> List[float]:
+        """获取价格历史"""
+        # 这里实现获取价格历史的逻辑
+        return []
+
+# AI模型训练类
+class AIModelTrainer:
+    """AI模型训练器"""
+    
+    def __init__(self):
+        self.models = {}
+        self.scalers = {}
+        
+    def train_price_predictor(self, historical_data: pd.DataFrame):
+        """训练价格预测模型"""
+        try:
+            # 特征工程
+            features = self._extract_features(historical_data)
+            labels = historical_data['future_price_change'].values
+            
+            # 分割数据集
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, labels, test_size=0.2, random_state=42
+            )
+            
+            # 标准化
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # 训练模型
+            model = GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42
+            )
+            
+            model.fit(X_train_scaled, y_train)
+            
+            # 评估模型
+            train_score = model.score(X_train_scaled, y_train)
+            test_score = model.score(X_test_scaled, y_test)
+            
+            logger.info(f"价格预测模型训练完成")
+            logger.info(f"训练集得分: {train_score:.4f}")
+            logger.info(f"测试集得分: {test_score:.4f}")
+            
+            # 保存模型
+            self.models['price_predictor'] = model
+            self.scalers['price_predictor'] = scaler
+            
+            # 保存到文件
+            joblib.dump(model, 'models/price_predictor.pkl')
+            joblib.dump(scaler, 'models/price_scaler.pkl')
+            
+            return model
+            
+        except Exception as e:
+            logger.error(f"训练价格预测模型失败: {e}")
+            return None
+    
+    def _extract_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """提取特征"""
+        features = pd.DataFrame()
+        
+        # 价格特征
+        features['price'] = data['price']
+        features['price_ma_5'] = data['price'].rolling(5).mean()
+        features['price_ma_20'] = data['price'].rolling(20).mean()
+        features['price_std_20'] = data['price'].rolling(20).std()
+        
+        # 交易量特征
+        features['volume'] = data['volume']
+        features['volume_ma_5'] = data['volume'].rolling(5).mean()
+        features['volume_ratio'] = data['volume'] / data['volume_ma_5']
+        
+        # 技术指标
+        features['rsi'] = self._calculate_rsi(data['price'])
+        features['macd'] = self._calculate_macd(data['price'])
+        features['bollinger_upper'] = features['price_ma_20'] + 2 * features['price_std_20']
+        features['bollinger_lower'] = features['price_ma_20'] - 2 * features['price_std_20']
+        
+        # 填充NaN值
+        features = features.fillna(0)
+        
+        return features
+    
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """计算RSI"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def _calculate_macd(self, prices: pd.Series) -> pd.Series:
+        """计算MACD"""
+        exp1 = prices.ewm(span=12, adjust=False).mean()
+        exp2 = prices.ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        return macd
+
+# 闪电贷套利模块
+class FlashLoanArbitrage:
+    """闪电贷套利模块"""
+    
+    def __init__(self, w3: Web3):
+        self.w3 = w3
+        self.aave_pool = None  # Aave V3池地址
+        self.pancake_router = None
+        
+    async def find_flash_loan_opportunities(self):
+        """寻找闪电贷套利机会"""
+        opportunities = []
+        
+        # 这里实现闪电贷套利逻辑
+        # 需要连接Aave、dydx等闪电贷协议
+        
+        return opportunities
+    
+    async def execute_flash_loan(self, opportunity: Dict):
+        """执行闪电贷套利"""
+        try:
+            # 闪电贷逻辑比较复杂
+            # 需要实现回调函数和完整的交易流程
+            pass
+        except Exception as e:
+            logger.error(f"闪电贷执行失败: {e}")
+
+# 风险管理模块
+class RiskManager:
+    """风险管理模块"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.daily_pnl = 0
+        self.max_drawdown = 0
+        self.position_sizes = {}
+        self.stop_losses = {}
+        
+    def calculate_position_size(self, opportunity: ArbitrageOpportunity, capital: float) -> float:
+        """计算仓位大小"""
+        # 凯利公式
+        win_rate = 0.6  # 假设胜率
+        win_loss_ratio = opportunity.profit_percentage / 0.01  # 假设损失为1%
+        
+        kelly = win_rate - (1 - win_rate) / win_loss_ratio
+        position = kelly * 0.5  # 半凯利
+        
+        # 风险调整
+        risk_adjustment = 1 - opportunity.risk_score
+        position *= risk_adjustment
+        
+        # 确保不超过最大仓位
+        max_position = self.config.get('max_position_size', 0.1)
+        position = min(position, max_position)
+        
+        return capital * position
+    
+    def should_execute(self, opportunity: ArbitrageOpportunity) -> bool:
+        """是否应该执行交易"""
+        # 检查每日损失限制
+        if self.daily_pnl < -self.config.get('daily_loss_limit', 0.05):
+            return False
+        
+        # 检查风险分数
+        if opportunity.risk_score > 0.8:
+            return False
+        
+        # 检查最小利润
+        if opportunity.net_profit < Decimal('1'):  # 至少1美元
+            return False
+        
+        # 检查Gas价格
+        current_gas = opportunity.gas_cost
+        if current_gas > Decimal('10'):  # Gas费用太高
+            return False
+        
+        return True
+
+async def main():
+    """主函数"""
+    # 加载配置
+    try:
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        # 创建默认配置
+        config = {
+            "rpc_url": "https://bsc-dataseed1.binance.org/",
+            "private_key": "YOUR_PRIVATE_KEY_HERE",
+            "min_profit_percentage": 0.005,
+            "max_slippage": 0.01,
+            "max_gas_price": 20,
+            "check_interval": 1,
+            "max_position_size": 0.1,
+            "daily_loss_limit": 0.05,
+            "binance_api_key": "",
+            "binance_api_secret": ""
+        }
+        
+        with open('config.json', 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        print("已创建配置文件 config.json，请编辑该文件设置您的私钥和配置")
+        return
+    
+    # 创建机器人实例
+    bot = BSCArbitrageBot('config.json')
+    
+    # 运行机器人
+    await bot.run()
+
+if __name__ == "__main__":
+    # 异步运行
+    asyncio.run(main())
