@@ -1,0 +1,104 @@
+#!/bin/bash
+# setup.sh - BSC套利机器人安装脚本
+
+echo "正在安装BSC套利机器人..."
+
+# 检查Python版本
+if ! command -v python3 &> /dev/null; then
+    echo "错误: 需要Python 3.8或更高版本"
+    exit 1
+fi
+
+python_version=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
+if [[ $python_version < 3.8 ]]; then
+    echo "错误: 需要Python 3.8或更高版本，当前版本: $python_version"
+    exit 1
+fi
+
+# 创建虚拟环境
+echo "创建虚拟环境..."
+python3 -m venv venv
+source venv/bin/activate
+
+# 安装依赖
+echo "安装依赖包..."
+pip install --upgrade pip
+
+# 基础依赖
+pip install web3==6.0.0
+pip install asyncio
+pip install aiohttp
+pip install ccxt==4.0.0
+pip install python-dotenv
+pip install numpy
+pip install pandas
+pip install scikit-learn
+pip install joblib
+pip install python-telegram-bot==20.3
+
+# 创建目录结构
+echo "创建目录结构..."
+mkdir -p abi
+mkdir -p logs
+mkdir -p data
+mkdir -p models
+mkdir -p config
+
+# 创建配置文件
+if [ ! -f "config.json" ]; then
+    echo "创建配置文件..."
+    cat > config.json << EOF
+{
+  "rpc_url": "https://bsc-dataseed1.binance.org/",
+  "private_key": "YOUR_PRIVATE_KEY_HERE",
+  "min_profit_percentage": 0.005,
+  "max_slippage": 0.01,
+  "max_gas_price": 20,
+  "check_interval": 1,
+  "max_position_size": 0.1,
+  "daily_loss_limit": 0.05
+}
+EOF
+    echo "请编辑 config.json 文件设置您的私钥"
+fi
+
+# 创建ABI文件
+echo "下载合约ABI..."
+# 这里可以添加下载实际ABI文件的逻辑
+# 或者从Etherscan等API获取
+
+# 创建启动脚本
+cat > start.sh << 'EOF'
+#!/bin/bash
+source venv/bin/activate
+python bsc_arbitrage_bot.py
+EOF
+
+chmod +x start.sh
+
+# 创建停止脚本
+cat > stop.sh << 'EOF'
+#!/bin/bash
+pkill -f "python bsc_arbitrage_bot.py"
+EOF
+
+chmod +x stop.sh
+
+# 创建监控脚本
+cat > monitor.sh << 'EOF'
+#!/bin/bash
+tail -f arbitrage_bot.log
+EOF
+
+chmod +x monitor.sh
+
+echo ""
+echo "安装完成！"
+echo ""
+echo "下一步:"
+echo "1. 编辑 config.json 文件设置您的私钥和配置"
+echo "2. 运行 ./start.sh 启动机器人"
+echo "3. 运行 ./monitor.sh 查看日志"
+echo "4. 运行 ./stop.sh 停止机器人"
+echo ""
+echo "注意: 请先在测试网测试，确保理解所有风险！"
