@@ -1,0 +1,169 @@
+"""
+监控和报警模块
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List
+import telegram
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+class BotMonitor:
+    """机器人监控器"""
+    
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.bot = telegram.Bot(token=bot_token)
+        self.alerts_sent = []
+        
+    async def send_alert(self, message: str, level: str = "INFO"):
+        """发送警报"""
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            formatted_message = f"[{timestamp}] [{level}]\n{message}"
+            
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=formatted_message,
+                parse_mode='HTML'
+            )
+            
+            self.alerts_sent.append({
+                'timestamp': datetime.now(),
+                'level': level,
+                'message': message
+            })
+            
+            logging.info(f"警报已发送: {message}")
+            
+        except Exception as e:
+            logging.error(f"发送警报失败: {e}")
+    
+    async def send_opportunity_alert(self, opportunity):
+        """发送套利机会警报"""
+        message = f"""
+🔥 <b>发现套利机会!</b>
+
+🔄 类型: {opportunity.id.split('_')[0].upper()}
+💰 预期利润: ${opportunity.net_profit:.2f}
+📈 利润率: {opportunity.profit_percentage:.2%}
+⚠️ 风险等级: {opportunity.risk_score}/1.0
+⏰ 时间: {opportunity.timestamp.strftime('%H:%M:%S')}
+
+路径: {' -> '.join([t.symbol for t in opportunity.path])}
+        """
+        
+        await self.send_alert(message, "OPPORTUNITY")
+    
+    async def send_trade_alert(self, trade_result):
+        """发送交易结果警报"""
+        if trade_result['success']:
+            message = f"""
+✅ <b>交易成功!</b>
+
+📊 利润: ${trade_result['profit']:.2f}
+🔗 交易哈希: {trade_result['tx_hash']}
+⏰ 时间: {trade_result['timestamp']}
+            """
+            await self.send_alert(message, "SUCCESS")
+        else:
+            message = f"""
+❌ <b>交易失败!</b>
+
+📝 错误信息: {trade_result['error']}
+⏰ 时间: {trade_result['timestamp']}
+            """
+            await self.send_alert(message, "ERROR")
+    
+    async def send_daily_report(self, stats: Dict):
+        """发送每日报告"""
+        message = f"""
+📊 <b>每日报告</b>
+
+📅 日期: {datetime.now().strftime('%Y-%m-%d')}
+💰 总利润: ${stats['total_profit']:.2f}
+📈 总交易: {stats['total_trades']}
+✅ 成功交易: {stats['successful_trades']}
+🎯 成功率: {stats['success_rate']:.1f}%
+⚡ 当前Gas价格: {stats['gas_price']:.1f} Gwei
+        """
+        
+        await self.send_alert(message, "REPORT")
+    
+    async def check_health(self, bot_status: Dict) -> bool:
+        """检查机器人健康状态"""
+        issues = []
+        
+        # 检查RPC连接
+        if not bot_status.get('rpc_connected', False):
+            issues.append("RPC连接失败")
+        
+        # 检查钱包余额
+        if bot_status.get('wallet_balance', 0) < 0.01:
+            issues.append("钱包余额不足 (< 0.01 BNB)")
+        
+        # 检查最近活动
+        last_activity = bot_status.get('last_activity')
+        if last_activity and (datetime.now() - last_activity) > timedelta(minutes=5):
+            issues.append("5分钟内无活动")
+        
+        if issues:
+            message = f"""
+⚠️ <b>健康检查发现问题</b>
+
+问题列表:
+{chr(10).join([f'• {issue}' for issue in issues])}
+
+请立即检查!
+            """
+            await self.send_alert(message, "WARNING")
+            return False
+        
+        return True
+
+# Telegram命令处理器
+async def start_command(update, context):
+    """处理/start命令"""
+    await update.message.reply_text(
+        "🤖 BSC套利机器人监控\n\n"
+        "可用命令:\n"
+        "/status - 查看机器人状态\n"
+        "/profit - 查看利润统计\n"
+        "/pause - 暂停机器人\n"
+        "/resume - 恢复机器人\n"
+        "/gas - 查看当前Gas价格\n"
+        "/help - 显示帮助信息"
+    )
+
+async def status_command(update, context):
+    """处理/status命令"""
+    # 这里获取机器人状态
+    status = {
+        'running': True,
+        'total_profit': 123.45,
+        'active_opportunities': 3,
+        'wallet_balance': 0.5
+    }
+    
+    message = f"""
+📊 <b>机器人状态</b>
+
+运行状态: {'✅ 运行中' if status['running'] else '⏸️ 已暂停'}
+总利润: ${status['total_profit']:.2f}
+活跃机会: {status['active_opportunities']}
+钱包余额: {status['wallet_balance']:.3f} BNB
+    """
+    
+    await update.message.reply_text(message, parse_mode='HTML')
+
+async def setup_telegram_bot(bot_token: str):
+    """设置Telegram机器人"""
+    application = Application.builder().token(bot_token).build()
+    
+    # 添加命令处理器
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    
+    return application
