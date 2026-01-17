@@ -1,0 +1,8 @@
+# 启动机器人
+./start.sh
+
+# 监控日志
+./monitor.sh
+
+# 停止机器人
+./stop.sh
