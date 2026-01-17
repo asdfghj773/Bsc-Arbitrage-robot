@@ -1,0 +1,51 @@
+{
+  "rpc_url": "https://bsc-dataseed1.binance.org/",
+  "private_key": "YOUR_PRIVATE_KEY_HERE",
+  "wallet_address": "YOUR_WALLET_ADDRESS",
+  "min_profit_percentage": 0.005,
+  "max_slippage": 0.01,
+  "max_gas_price": 20,
+  "check_interval": 1,
+  "max_position_size": 0.1,
+  "daily_loss_limit": 0.05,
+  "binance_api_key": "YOUR_BINANCE_API_KEY",
+  "binance_api_secret": "YOUR_BINANCE_API_SECRET",
+  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
+  "alert_threshold": 0.02,
+  "whitelisted_tokens": [
+    "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    "0x55d398326f99059fF775485246999027B3197955",
+    "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
+    "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
+    "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c"
+  ],
+  "blacklisted_tokens": [],
+  "dex_settings": {
+    "pancakeswap_v2": {
+      "router": "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+      "factory": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+      "enabled": true
+    },
+    "biswap": {
+      "router": "0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8",
+      "factory": "0x858E3312ed3A876947EA49d572A7C42DE08af7EE",
+      "enabled": true
+    },
+    "apeswap": {
+      "router": "0xcF0feBd3f17CEf5b47b0cD257aCf6025c5BFf3b7",
+      "factory": "0x0841BD0B734E4F5853f0dD8d7Ea041c241fb0Da6",
+      "enabled": true
+    }
+  },
+  "ai_settings": {
+    "model_path": "models/price_predictor.pkl",
+    "training_interval": 3600,
+    "prediction_confidence_threshold": 0.7
+  },
+  "monitoring": {
+    "enable_telegram_alerts": true,
+    "enable_email_alerts": false,
+    "health_check_interval": 60
+  }
+}
