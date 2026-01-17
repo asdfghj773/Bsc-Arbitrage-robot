@@ -1,0 +1,12 @@
+# 构建Docker镜像
+docker build -t bsc-arbitrage-bot .
+
+# 运行容器
+docker run -d \
+  --name arb-bot \
+  -v $(pwd)/config.json:/app/config.json \
+  -v $(pwd)/logs:/app/logs \
+  bsc-arbitrage-bot
+
+# 查看日志
+docker logs -f arb-bot
