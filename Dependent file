@@ -1,0 +1,15 @@
+web3==6.0.0
+asyncio==3.4.3
+aiohttp==3.8.5
+ccxt==4.0.0
+python-dotenv==1.0.0
+numpy==1.24.3
+pandas==2.0.3
+scikit-learn==1.3.0
+joblib==1.3.2
+python-telegram-bot==20.3
+matplotlib==3.7.2
+seaborn==0.12.2
+psycopg2-binary==2.9.7  # 如果使用PostgreSQL
+redis==4.6.0  # 如果使用Redis
+celery==5.3.1  # 如果使用任务队列
