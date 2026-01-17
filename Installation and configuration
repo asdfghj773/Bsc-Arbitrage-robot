@@ -1,0 +1,11 @@
+# 克隆代码
+git clone https://github.com/yourusername/bsc-arbitrage-bot.git
+cd bsc-arbitrage-bot
+
+# 运行安装脚本
+chmod +x setup.sh
+./setup.sh
+
+# 编辑配置文件
+nano config.json
+# 设置您的私钥和其他配置
